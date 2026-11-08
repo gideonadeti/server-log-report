@@ -1,5 +1,8 @@
 # server-log-report
 
+[![ci](https://github.com/gideonadeti/server-log-report/actions/workflows/ci.yml/badge.svg)](https://github.com/gideonadeti/server-log-report/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Turn an nginx or Apache access log into a small Markdown traffic report — no
 dependencies beyond the standard Unix tools.
 
@@ -64,6 +67,7 @@ report.sh [options]
       --fields F,F,F,F  custom field numbers: IP,PATH,STATUS,BYTES
                         (overrides --format)
       --since DATE      only count entries on or after DATE (YYYY-MM-DD)
+      --until DATE      only count entries on or before DATE (YYYY-MM-DD)
       --json            print a JSON report to stdout instead of Markdown
       --csv             print a CSV report to stdout instead of Markdown
       --include-rotated read PATH.1 and PATH.*.gz as well
@@ -92,6 +96,9 @@ Examples:
 
 # only the last week (GNU date; macOS: date -v-7d +%F)
 ./report.sh -l /var/log/nginx/access.log --since "$(date -d '7 days ago' +%F)"
+
+# a specific window
+./report.sh -l /var/log/nginx/access.log --since 2026-11-01 --until 2026-11-07
 
 # include rotated logs (a whole week, not just today)
 ./report.sh -l /var/log/nginx/access.log --include-rotated
@@ -132,12 +139,15 @@ awk '{print $9}' access.log | sort -u    # do these look like status codes?
 
 JSON-formatted logs are a different tool problem — use `jq` directly.
 
-## Filtering by date (`--since`)
+## Filtering by date (`--since` / `--until`)
 
-`--since YYYY-MM-DD` keeps only entries dated on or after that day:
+`--since YYYY-MM-DD` keeps entries on or after that day; `--until YYYY-MM-DD`
+keeps entries on or before it. Use either or both:
 
 ```bash
 ./report.sh --log access.log --since 2026-11-01
+./report.sh --log access.log --until 2026-11-07
+./report.sh --log access.log --since 2026-11-01 --until 2026-11-07
 ./report.sh --log access.log --since "$(date -d '7 days ago' +%F)"   # GNU date
 ./report.sh --log access.log --since "$(date -v-7d +%F)"             # macOS
 ```
@@ -148,7 +158,8 @@ sits in a different field — without a separate date-field option.
 
 Because filtering happens after reading, it composes with `--include-rotated`:
 load the whole rotated set, then report only the window you care about. Lines
-with no recognisable date are dropped when `--since` is set.
+with no recognisable date are dropped when either bound is set. A reversed
+range (`--since` after `--until`) is rejected.
 
 ## JSON output
 
@@ -167,6 +178,7 @@ The shape is stable and meant for automation:
   "source": "access.log",
   "format": "combined",
   "since": null,
+  "until": null,
   "health": { "url": "https://example.com", "up": true },
   "summary": {
     "requests": 300,
@@ -197,6 +209,7 @@ meta,generated_at,"2026-11-08T06:30:18Z"
 meta,source,"/var/log/nginx/access.log"
 meta,format,"combined"
 meta,since,2026-11-05
+meta,until,2026-11-07
 summary,requests,300
 summary,status_4xx,38
 summary,status_5xx,75

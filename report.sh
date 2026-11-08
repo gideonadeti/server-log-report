@@ -7,7 +7,7 @@
 #
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.0.0"
 PROG="$(basename "$0")"
 
 LOG="/var/log/nginx/access.log"
@@ -20,6 +20,8 @@ JSON_OUT=0
 CSV_OUT=0
 SINCE=""
 SINCE_NUM=""
+UNTIL=""
+UNTIL_NUM=""
 
 FORMAT="combined"
 IP_FIELD=1
@@ -46,6 +48,7 @@ Options:
       --fields F,F,F,F  custom field numbers: IP,PATH,STATUS,BYTES
                         (overrides --format)
       --since DATE      only count entries on or after DATE (YYYY-MM-DD)
+      --until DATE      only count entries on or before DATE (YYYY-MM-DD)
       --json            print a JSON report to stdout instead of Markdown
       --csv             print a CSV report to stdout instead of Markdown
       --include-rotated read PATH.1 and PATH.*.gz as well
@@ -66,6 +69,7 @@ Examples:
   $PROG
   $PROG --log /var/log/apache2/access.log --format vhost_combined
   $PROG --log access.log --since 2026-11-01
+  $PROG --log access.log --since 2026-11-01 --until 2026-11-07
   $PROG --log access.log --since "\$(date -d '7 days ago' +%F)"   # GNU date
   $PROG --log access.log --json | jq .
   $PROG --log access.log --csv > report.csv
@@ -101,8 +105,9 @@ set_format() {
 parse_fields() {
     local a b c d
     IFS=',' read -r a b c d <<< "$1"
-    valid_field "$a" && valid_field "$b" && valid_field "$c" && valid_field "$d" \
-        || die "--fields expects four positive numbers: IP,PATH,STATUS,BYTES"
+    if ! valid_field "$a" || ! valid_field "$b" || ! valid_field "$c" || ! valid_field "$d"; then
+        die "--fields expects four positive numbers: IP,PATH,STATUS,BYTES"
+    fi
     IP_FIELD="$a"; PATH_FIELD="$b"; STATUS_FIELD="$c"; BYTES_FIELD="$d"
 }
 
@@ -115,6 +120,7 @@ while [ "$#" -gt 0 ]; do
         -f|--format)       need_value "$@"; FORMAT="$2";       shift 2 ;;
         --fields)          need_value "$@"; FIELDS_OVERRIDE="$2"; shift 2 ;;
         --since)           need_value "$@"; SINCE="$2";        shift 2 ;;
+        --until)           need_value "$@"; UNTIL="$2";        shift 2 ;;
         --json)            JSON_OUT=1;                         shift ;;
         --csv)             CSV_OUT=1;                          shift ;;
         --include-rotated) INCLUDE_ROTATED=1;                  shift ;;
@@ -141,6 +147,18 @@ if [ -n "$SINCE" ]; then
         *) die "--since expects a date in YYYY-MM-DD form" ;;
     esac
     SINCE_NUM="${SINCE//-/}"
+fi
+
+if [ -n "$UNTIL" ]; then
+    case "$UNTIL" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *) die "--until expects a date in YYYY-MM-DD form" ;;
+    esac
+    UNTIL_NUM="${UNTIL//-/}"
+fi
+
+if [ -n "$SINCE_NUM" ] && [ -n "$UNTIL_NUM" ] && [ "$SINCE_NUM" -gt "$UNTIL_NUM" ]; then
+    die "--since ($SINCE) is after --until ($UNTIL)"
 fi
 
 set_format "$FORMAT"
@@ -215,10 +233,12 @@ read_logs() {
 
 read_logs > "$WORK"
 
-# --since: find the [DD/Mon/YYYY:...] token wherever it sits in the line, so it
-# works for any of the supported formats without knowing the date's field number.
-if [ -n "$SINCE" ]; then
-    awk -v since="$SINCE_NUM" '
+# --since/--until: find the [DD/Mon/YYYY:...] token wherever it sits in the
+# line, so this works for any supported format without a date-field option.
+if [ -n "$SINCE" ] || [ -n "$UNTIL" ]; then
+    since_num="${SINCE_NUM:-0}"
+    until_num="${UNTIL_NUM:-99999999}"
+    awk -v since="$since_num" -v until="$until_num" '
         {
             d = ""
             for (i = 1; i <= NF; i++) {
@@ -234,7 +254,7 @@ if [ -n "$SINCE" ]; then
             if (mon == 0) next
             mon = (mon + 2) / 3
             ymd = p[3] * 10000 + mon * 100 + p[1]
-            if (ymd >= since) print
+            if (ymd >= since && ymd <= until) print
         }
     ' "$WORK" > "$WORKDIR/filtered"
     mv "$WORKDIR/filtered" "$WORK"
@@ -289,6 +309,9 @@ if [ "$CSV_OUT" -eq 1 ]; then
     printf 'meta,format,%s\n' "$(csv_escape "$FORMAT")"
     if [ -n "$SINCE" ]; then
         printf 'meta,since,%s\n' "$SINCE"
+    fi
+    if [ -n "$UNTIL" ]; then
+        printf 'meta,until,%s\n' "$UNTIL"
     fi
     if [ -n "$URL" ]; then
         printf 'meta,health_url,%s\n' "$(csv_escape "$URL")"
@@ -345,6 +368,7 @@ if [ "$JSON_OUT" -eq 1 ]; then
         --arg source "$LOG" \
         --arg format "$FORMAT" \
         --arg since "$SINCE" \
+        --arg until "$UNTIL" \
         --argjson health "$health_json" \
         --argjson summary "$summary_json" \
         --argjson top_ips_by_5xx "$ips_json" \
@@ -353,6 +377,7 @@ if [ "$JSON_OUT" -eq 1 ]; then
         --argjson malformed_lines "$malformed" \
         '{generated_at: $generated_at, source: $source, format: $format,
           since: (if $since == "" then null else $since end),
+          until: (if $until == "" then null else $until end),
           health: $health, summary: $summary, top_ips_by_5xx: $top_ips_by_5xx,
           top_paths: $top_paths, status_codes: $status_codes,
           malformed_lines: $malformed_lines}'
@@ -368,10 +393,14 @@ print_tsv() {
 
 {
     printf '# Traffic report — %s\n\n' "$(date +%F)"
+    # shellcheck disable=SC2016  # backticks here are Markdown, not commands
     printf 'Source: `%s` · format: %s · %s requests · %s MB served' \
         "$LOG" "$FORMAT" "$total" "$served"
     if [ -n "$SINCE" ]; then
         printf ' · since: %s' "$SINCE"
+    fi
+    if [ -n "$UNTIL" ]; then
+        printf ' · until: %s' "$UNTIL"
     fi
     if [ -n "$HEALTH_STATUS" ]; then
         printf ' · health: up'

@@ -13,6 +13,13 @@ jobs:
       - name: Syntax check
         run: bash -n report.sh
 
+      - name: ShellCheck
+        run: |
+          if ! command -v shellcheck >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y shellcheck
+          fi
+          shellcheck report.sh sample/generate-log.sh
+
       - name: Generate a sample log
         run: ./sample/generate-log.sh 300 > /tmp/access.log
 
@@ -44,7 +51,7 @@ jobs:
           grep -q '^summary,requests,300$' /tmp/report.csv
           python3 -c "import csv; r=list(csv.reader(open('/tmp/report.csv'))); assert all(len(x)==3 for x in r); print(len(r), 'rows OK')"
 
-      - name: --since filtering
+      - name: --since / --until filtering
         run: |
           sed 's#08/Nov/2026#01/Nov/2026#' /tmp/access.log > /tmp/mixed.log
           cat /tmp/access.log >> /tmp/mixed.log
@@ -52,8 +59,16 @@ jobs:
             | jq -e '.summary.requests == 300 and .since == "2026-11-05"'
           ./report.sh --log /tmp/mixed.log --since 2026-11-01 --json \
             | jq -e '.summary.requests == 600'
+          ./report.sh --log /tmp/mixed.log --until 2026-11-01 --json \
+            | jq -e '.summary.requests == 300 and .until == "2026-11-01"'
+          ./report.sh --log /tmp/mixed.log --since 2026-11-02 --until 2026-11-08 --json \
+            | jq -e '.summary.requests == 300'
           ./report.sh --log /tmp/mixed.log --since 2026-11-09 --json \
             | jq -e '.summary.requests == 0'
+          if ./report.sh --log /tmp/mixed.log --since 2026-11-08 --until 2026-11-01; then
+            echo "expected failure for reversed range" >&2
+            exit 1
+          fi
 
       - name: --json and --csv are mutually exclusive
         run: |
