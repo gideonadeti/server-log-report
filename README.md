@@ -30,6 +30,7 @@ dotfiles.
 - `awk`, `sort`, `uniq`, `wc`, `mktemp` — on every Unix
 - `curl` — only if you use `--url`
 - `gzip` — only if you use `--include-rotated`
+- `jq` — only if you use `--json`
 
 ## Quick start
 
@@ -59,6 +60,10 @@ report.sh [options]
   -u, --url URL         health-check this URL before reporting
   -o, --out-dir DIR     where to write the report (default: ./reports)
   -n, --top N           rows per section (default: 5)
+  -f, --format NAME     input format: combined (default), common, vhost_combined
+      --fields F,F,F,F  custom field numbers: IP,PATH,STATUS,BYTES
+                        (overrides --format)
+      --json            print a JSON report to stdout instead of Markdown
       --include-rotated read PATH.1 and PATH.*.gz as well
       --health-only     only run the health check, then exit
   -h, --help            show the help
@@ -71,8 +76,14 @@ Examples:
 # nginx, with an uptime check
 ./report.sh -l /var/log/nginx/access.log -u https://example.com
 
-# Apache
-./report.sh -l /var/log/apache2/access.log
+# Apache vhost logs
+./report.sh -l /var/log/apache2/access.log --format vhost_combined
+
+# a custom log_format: client IP is field 2, path 8, status 10, bytes 11
+./report.sh -l /var/log/myservice/access.log --fields 2,8,10,11
+
+# machine-readable output, ready for jq/other tools
+./report.sh -l /var/log/nginx/access.log --json | jq '.summary'
 
 # include rotated logs (a whole week, not just today)
 ./report.sh -l /var/log/nginx/access.log --include-rotated
@@ -83,6 +94,70 @@ zcat /var/log/nginx/access.log.*.gz | ./report.sh --log -
 # just check that a site is up
 ./report.sh --health-only --url https://example.com
 ```
+
+## Input formats
+
+Field positions are what break when you point this at a new server, so they are
+named instead of buried in the code.
+
+| `--format` | IP | path | status | bytes | Typical source |
+|---|---:|---:|---:|---:|---|
+| `combined` (default) | 1 | 7 | 9 | 10 | nginx default, Apache "combined" |
+| `common` | 1 | 7 | 9 | 10 | Apache "common" |
+| `vhost_combined` | 2 | 8 | 10 | 11 | Apache vhost logs |
+
+`common` shares positions with `combined` because the only difference is the
+referrer/user-agent tail, which this script doesn't read.
+
+For anything else, pass the four positions yourself:
+
+```bash
+./report.sh --log access.log --fields 2,8,10,11
+```
+
+Check before trusting it:
+
+```bash
+awk '{print NF}' access.log | sort -u    # consistent field count?
+awk '{print $9}' access.log | sort -u    # do these look like status codes?
+```
+
+JSON-formatted logs are a different tool problem — use `jq` directly.
+
+## JSON output
+
+`--json` prints the whole report to stdout, so you can pipe it anywhere:
+
+```bash
+./report.sh --log access.log --json | jq '.summary.status_5xx'
+./report.sh --log access.log --json > report.json
+```
+
+The shape is stable and meant for automation:
+
+```json
+{
+  "generated_at": "2026-11-08T06:26:28Z",
+  "source": "access.log",
+  "format": "combined",
+  "health": { "url": "https://example.com", "up": true },
+  "summary": {
+    "requests": 300,
+    "status_4xx": 38,
+    "status_5xx": 75,
+    "error_rate_pct": 25.0,
+    "bytes_served": 747766
+  },
+  "top_ips_by_5xx": [ { "ip": "192.0.2.44", "count": 23 } ],
+  "top_paths": [ { "path": "/api/orders", "count": 58 } ],
+  "status_codes": [ { "status": 200, "count": 164 } ],
+  "malformed_lines": 0
+}
+```
+
+`health` is `null` when `--url` isn't given. A failed health check writes an
+error to stderr and exits non-zero, so a broken site never produces a report
+that looks healthy. `--health-only --json` prints just the health object.
 
 ## Running it locally (e.g. `localhost:3000`)
 
@@ -129,8 +204,9 @@ sudo awk '{print NF}' /var/log/nginx/access.log | sort -u   # should be consiste
 sudo awk '{print $9}' /var/log/nginx/access.log | sort -u    # should be status codes
 ```
 
-If your server uses a custom `log_format`, change `$1`, `$7` and `$9` in
-`report.sh`. If your logs are JSON, this script is the wrong tool — use `jq`.
+If your server uses a custom `log_format`, use `--fields` (or `--format`)
+instead of editing the script. If your logs are JSON, this script is the wrong
+tool — use `jq`.
 
 ## Permissions
 
@@ -209,8 +285,9 @@ systemctl --user enable --now server-report.timer
 - **Behind a proxy/CDN** (Cloudflare, a load balancer), the logged IP is the
   proxy's, not the visitor's. Configure `real_ip` in nginx or read
   `X-Forwarded-For` if that matters.
-- **Custom log formats** need field changes. The script warns if lines don't
-  have at least 9 fields, but it cannot know your format.
+- **Custom log formats** need the right field numbers. Use `--format` for the
+  built-in layouts or `--fields` for anything else; the script warns if lines
+  have fewer fields than the format expects, but it cannot know your layout.
 - **This is a summary, not analytics.** It answers "is anything on fire?"
   For funnels, retention, and dashboards, use a real analytics product.
 

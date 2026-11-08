@@ -16,15 +16,44 @@ jobs:
       - name: Generate a sample log
         run: ./sample/generate-log.sh 300 > /tmp/access.log
 
-      - name: Run the report
-        run: ./report.sh --log /tmp/access.log --out-dir /tmp/out
+      - name: Markdown report
+        run: ./report.sh --log /tmp/access.log --out-dir /tmp/out --top 3
 
-      - name: Show the result
-        run: cat /tmp/out/report_*.md
+      - name: JSON report
+        run: |
+          ./report.sh --log /tmp/access.log --json > /tmp/report.json
+          jq -e '.summary.requests == 300' /tmp/report.json
+          jq -e '.summary.status_5xx > 0' /tmp/report.json
+          jq -e '.top_paths | length == 5' /tmp/report.json
+
+      - name: vhost_combined format
+        run: |
+          sed 's/^/example.com:443 /' /tmp/access.log > /tmp/vhost.log
+          ./report.sh --log /tmp/vhost.log --format vhost_combined --json \
+            | jq -e '.summary.requests == 300'
+
+      - name: Custom fields
+        run: |
+          ./report.sh --log /tmp/vhost.log --fields 2,8,10,11 --json \
+            | jq -e '.format == "custom(2,8,10,11)"'
+
+      - name: Health check against a local server
+        run: |
+          python3 -m http.server 3000 --bind 127.0.0.1 >/dev/null 2>&1 &
+          sleep 1
+          ./report.sh --health-only --url http://localhost:3000 --json \
+            | jq -e '.up == true'
 
       - name: Missing log should fail
         run: |
           if ./report.sh --log /tmp/does-not-exist.log; then
+            echo "expected failure" >&2
+            exit 1
+          fi
+
+      - name: Unknown format should fail
+        run: |
+          if ./report.sh --log /tmp/access.log --format nope; then
             echo "expected failure" >&2
             exit 1
           fi
