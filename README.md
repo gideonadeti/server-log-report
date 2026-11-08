@@ -63,7 +63,9 @@ report.sh [options]
   -f, --format NAME     input format: combined (default), common, vhost_combined
       --fields F,F,F,F  custom field numbers: IP,PATH,STATUS,BYTES
                         (overrides --format)
+      --since DATE      only count entries on or after DATE (YYYY-MM-DD)
       --json            print a JSON report to stdout instead of Markdown
+      --csv             print a CSV report to stdout instead of Markdown
       --include-rotated read PATH.1 and PATH.*.gz as well
       --health-only     only run the health check, then exit
   -h, --help            show the help
@@ -84,6 +86,12 @@ Examples:
 
 # machine-readable output, ready for jq/other tools
 ./report.sh -l /var/log/nginx/access.log --json | jq '.summary'
+
+# CSV for a spreadsheet
+./report.sh -l /var/log/nginx/access.log --csv > report.csv
+
+# only the last week (GNU date; macOS: date -v-7d +%F)
+./report.sh -l /var/log/nginx/access.log --since "$(date -d '7 days ago' +%F)"
 
 # include rotated logs (a whole week, not just today)
 ./report.sh -l /var/log/nginx/access.log --include-rotated
@@ -124,6 +132,24 @@ awk '{print $9}' access.log | sort -u    # do these look like status codes?
 
 JSON-formatted logs are a different tool problem — use `jq` directly.
 
+## Filtering by date (`--since`)
+
+`--since YYYY-MM-DD` keeps only entries dated on or after that day:
+
+```bash
+./report.sh --log access.log --since 2026-11-01
+./report.sh --log access.log --since "$(date -d '7 days ago' +%F)"   # GNU date
+./report.sh --log access.log --since "$(date -v-7d +%F)"             # macOS
+```
+
+It finds the `[DD/Mon/YYYY:...]` token wherever it appears in the line, so it
+works with every supported format — including `vhost_combined`, where the date
+sits in a different field — without a separate date-field option.
+
+Because filtering happens after reading, it composes with `--include-rotated`:
+load the whole rotated set, then report only the window you care about. Lines
+with no recognisable date are dropped when `--since` is set.
+
 ## JSON output
 
 `--json` prints the whole report to stdout, so you can pipe it anywhere:
@@ -140,6 +166,7 @@ The shape is stable and meant for automation:
   "generated_at": "2026-11-08T06:26:28Z",
   "source": "access.log",
   "format": "combined",
+  "since": null,
   "health": { "url": "https://example.com", "up": true },
   "summary": {
     "requests": 300,
@@ -158,6 +185,39 @@ The shape is stable and meant for automation:
 `health` is `null` when `--url` isn't given. A failed health check writes an
 error to stderr and exits non-zero, so a broken site never produces a report
 that looks healthy. `--health-only --json` prints just the health object.
+
+## CSV output
+
+`--csv` prints a long/tidy table — one row per value, with a `section` column so
+summary numbers, top IPs, top paths, and status codes can share one file:
+
+```csv
+section,key,value
+meta,generated_at,"2026-11-08T06:30:18Z"
+meta,source,"/var/log/nginx/access.log"
+meta,format,"combined"
+meta,since,2026-11-05
+summary,requests,300
+summary,status_4xx,38
+summary,status_5xx,75
+summary,error_rate_pct,25.00
+summary,bytes_served,747766
+summary,malformed_lines,0
+top_ips_by_5xx,"192.0.2.44",23
+top_paths,"/api/orders",58
+status_codes,"200",164
+```
+
+Values are quoted and escaped per RFC 4180, so paths containing commas or
+quotes survive intact (verified in the test suite). Load it with any
+spreadsheet, `pandas.read_csv`, or `sqlite3`:
+
+```bash
+./report.sh --log access.log --csv > report.csv
+python3 -c "import pandas as pd; print(pd.read_csv('report.csv').head())"
+```
+
+`--json` and `--csv` are mutually exclusive; pick one.
 
 ## Running it locally (e.g. `localhost:3000`)
 

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# report.sh — turn an nginx/Apache access log into a Markdown or JSON report.
+# report.sh — turn an nginx/Apache access log into a Markdown, JSON, or CSV report.
 #
 # Field positions depend on the log format. The three built-in formats cover the
 # common cases; --fields is the escape hatch for anything custom.
 #
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 PROG="$(basename "$0")"
 
 LOG="/var/log/nginx/access.log"
@@ -17,6 +17,9 @@ TOP=5
 INCLUDE_ROTATED=0
 HEALTH_ONLY=0
 JSON_OUT=0
+CSV_OUT=0
+SINCE=""
+SINCE_NUM=""
 
 FORMAT="combined"
 IP_FIELD=1
@@ -42,7 +45,9 @@ Options:
                         vhost_combined
       --fields F,F,F,F  custom field numbers: IP,PATH,STATUS,BYTES
                         (overrides --format)
+      --since DATE      only count entries on or after DATE (YYYY-MM-DD)
       --json            print a JSON report to stdout instead of Markdown
+      --csv             print a CSV report to stdout instead of Markdown
       --include-rotated read PATH.1 and PATH.*.gz as well
       --health-only     only run the health check, then exit
   -h, --help            show this help
@@ -55,11 +60,15 @@ Formats:
                   referrer/user-agent tail, which this script ignores
   vhost_combined  \$2 IP  \$8 path  \$10 status \$11 bytes   (Apache vhost logs)
 
+CSV output uses a long/tidy layout: section,key,value.
+
 Examples:
   $PROG
   $PROG --log /var/log/apache2/access.log --format vhost_combined
-  $PROG --log /var/log/nginx/access.log --url https://example.com --json | jq .
-  $PROG --log sample/access.log --fields 2,8,10,11
+  $PROG --log access.log --since 2026-11-01
+  $PROG --log access.log --since "\$(date -d '7 days ago' +%F)"   # GNU date
+  $PROG --log access.log --json | jq .
+  $PROG --log access.log --csv > report.csv
   $PROG --health-only --url http://localhost:3000
   zcat access.log.*.gz | $PROG --log -
 EOF
@@ -105,7 +114,9 @@ while [ "$#" -gt 0 ]; do
         -n|--top)          need_value "$@"; TOP="$2";          shift 2 ;;
         -f|--format)       need_value "$@"; FORMAT="$2";       shift 2 ;;
         --fields)          need_value "$@"; FIELDS_OVERRIDE="$2"; shift 2 ;;
+        --since)           need_value "$@"; SINCE="$2";        shift 2 ;;
         --json)            JSON_OUT=1;                         shift ;;
+        --csv)             CSV_OUT=1;                          shift ;;
         --include-rotated) INCLUDE_ROTATED=1;                  shift ;;
         --health-only)     HEALTH_ONLY=1;                      shift ;;
         -h|--help)         usage; exit 0 ;;
@@ -120,6 +131,17 @@ case "$TOP" in
     ''|*[!0-9]*) die "--top must be a positive integer" ;;
 esac
 [ "$TOP" -gt 0 ] || die "--top must be a positive integer"
+
+[ "$JSON_OUT" -eq 1 ] && [ "$CSV_OUT" -eq 1 ] \
+    && die "choose one of --json or --csv, not both"
+
+if [ -n "$SINCE" ]; then
+    case "$SINCE" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *) die "--since expects a date in YYYY-MM-DD form" ;;
+    esac
+    SINCE_NUM="${SINCE//-/}"
+fi
 
 set_format "$FORMAT"
 if [ -n "$FIELDS_OVERRIDE" ]; then
@@ -142,7 +164,7 @@ check_url() {
     command -v curl >/dev/null 2>&1 || die "curl not found (needed for --url)"
     if curl -sf -o /dev/null --max-time 10 -- "$URL"; then
         HEALTH_STATUS="up"
-        if [ "$JSON_OUT" -eq 0 ]; then
+        if [ "$JSON_OUT" -eq 0 ] && [ "$CSV_OUT" -eq 0 ]; then
             printf 'health: %s is up\n' "$URL"
         fi
     else
@@ -155,6 +177,9 @@ if [ "$HEALTH_ONLY" -eq 1 ]; then
     check_url
     if [ "$JSON_OUT" -eq 1 ]; then
         jq -n --arg url "$URL" '{url: $url, up: true}'
+    elif [ "$CSV_OUT" -eq 1 ]; then
+        printf 'section,key,value\nhealth,url,"%s"\nhealth,up,true\n' \
+            "${URL//\"/\"\"}"
     fi
     exit 0
 fi
@@ -189,6 +214,31 @@ read_logs() {
 }
 
 read_logs > "$WORK"
+
+# --since: find the [DD/Mon/YYYY:...] token wherever it sits in the line, so it
+# works for any of the supported formats without knowing the date's field number.
+if [ -n "$SINCE" ]; then
+    awk -v since="$SINCE_NUM" '
+        {
+            d = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^\[[0-9][0-9]\/[A-Za-z][A-Za-z][A-Za-z]\/[0-9][0-9][0-9][0-9]:/) {
+                    d = $i
+                    break
+                }
+            }
+            if (d == "") next
+            sub(/^\[/, "", d)
+            split(d, p, /[\/:]/)
+            mon = index("JanFebMarAprMayJunJulAugSepOctNovDec", p[2])
+            if (mon == 0) next
+            mon = (mon + 2) / 3
+            ymd = p[3] * 10000 + mon * 100 + p[1]
+            if (ymd >= since) print
+        }
+    ' "$WORK" > "$WORKDIR/filtered"
+    mv "$WORKDIR/filtered" "$WORK"
+fi
 
 total=$(wc -l < "$WORK" | tr -d '[:space:]')
 errors4=$(awk -v f="$STATUS_FIELD" '$f ~ /^4/' "$WORK" | wc -l | tr -d '[:space:]')
@@ -226,6 +276,45 @@ awk -v p="$PATH_FIELD" '{ print $p }' "$WORK" \
 awk -v st="$STATUS_FIELD" '{ print $st }' "$WORK" \
     | count_all_tsv > "$WORKDIR/status.tsv"
 
+csv_escape() {
+    local s="$1"
+    s="${s//\"/\"\"}"
+    printf '"%s"' "$s"
+}
+
+if [ "$CSV_OUT" -eq 1 ]; then
+    printf 'section,key,value\n'
+    printf 'meta,generated_at,%s\n' "$(csv_escape "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+    printf 'meta,source,%s\n' "$(csv_escape "$LOG")"
+    printf 'meta,format,%s\n' "$(csv_escape "$FORMAT")"
+    if [ -n "$SINCE" ]; then
+        printf 'meta,since,%s\n' "$SINCE"
+    fi
+    if [ -n "$URL" ]; then
+        printf 'meta,health_url,%s\n' "$(csv_escape "$URL")"
+    fi
+    printf 'summary,requests,%s\n' "$total"
+    printf 'summary,status_4xx,%s\n' "$errors4"
+    printf 'summary,status_5xx,%s\n' "$errors5"
+    printf 'summary,error_rate_pct,%s\n' "$rate"
+    printf 'summary,bytes_served,%s\n' "$bytes"
+    printf 'summary,malformed_lines,%s\n' "$malformed"
+
+    while IFS=$'\t' read -r count value; do
+        printf 'top_ips_by_5xx,%s,%s\n' "$(csv_escape "$value")" "$count"
+    done < "$WORKDIR/ips.tsv"
+
+    while IFS=$'\t' read -r count value; do
+        printf 'top_paths,%s,%s\n' "$(csv_escape "$value")" "$count"
+    done < "$WORKDIR/paths.tsv"
+
+    while IFS=$'\t' read -r count value; do
+        printf 'status_codes,%s,%s\n' "$(csv_escape "$value")" "$count"
+    done < "$WORKDIR/status.tsv"
+
+    exit 0
+fi
+
 if [ "$JSON_OUT" -eq 1 ]; then
     health_json="null"
     if [ -n "$URL" ]; then
@@ -255,6 +344,7 @@ if [ "$JSON_OUT" -eq 1 ]; then
         --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --arg source "$LOG" \
         --arg format "$FORMAT" \
+        --arg since "$SINCE" \
         --argjson health "$health_json" \
         --argjson summary "$summary_json" \
         --argjson top_ips_by_5xx "$ips_json" \
@@ -262,6 +352,7 @@ if [ "$JSON_OUT" -eq 1 ]; then
         --argjson status_codes "$status_json" \
         --argjson malformed_lines "$malformed" \
         '{generated_at: $generated_at, source: $source, format: $format,
+          since: (if $since == "" then null else $since end),
           health: $health, summary: $summary, top_ips_by_5xx: $top_ips_by_5xx,
           top_paths: $top_paths, status_codes: $status_codes,
           malformed_lines: $malformed_lines}'
@@ -279,6 +370,9 @@ print_tsv() {
     printf '# Traffic report — %s\n\n' "$(date +%F)"
     printf 'Source: `%s` · format: %s · %s requests · %s MB served' \
         "$LOG" "$FORMAT" "$total" "$served"
+    if [ -n "$SINCE" ]; then
+        printf ' · since: %s' "$SINCE"
+    fi
     if [ -n "$HEALTH_STATUS" ]; then
         printf ' · health: up'
     fi

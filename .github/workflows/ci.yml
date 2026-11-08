@@ -37,6 +37,31 @@ jobs:
           ./report.sh --log /tmp/vhost.log --fields 2,8,10,11 --json \
             | jq -e '.format == "custom(2,8,10,11)"'
 
+      - name: CSV output
+        run: |
+          ./report.sh --log /tmp/access.log --csv > /tmp/report.csv
+          head -1 /tmp/report.csv | grep -q '^section,key,value$'
+          grep -q '^summary,requests,300$' /tmp/report.csv
+          python3 -c "import csv; r=list(csv.reader(open('/tmp/report.csv'))); assert all(len(x)==3 for x in r); print(len(r), 'rows OK')"
+
+      - name: --since filtering
+        run: |
+          sed 's#08/Nov/2026#01/Nov/2026#' /tmp/access.log > /tmp/mixed.log
+          cat /tmp/access.log >> /tmp/mixed.log
+          ./report.sh --log /tmp/mixed.log --since 2026-11-05 --json \
+            | jq -e '.summary.requests == 300 and .since == "2026-11-05"'
+          ./report.sh --log /tmp/mixed.log --since 2026-11-01 --json \
+            | jq -e '.summary.requests == 600'
+          ./report.sh --log /tmp/mixed.log --since 2026-11-09 --json \
+            | jq -e '.summary.requests == 0'
+
+      - name: --json and --csv are mutually exclusive
+        run: |
+          if ./report.sh --log /tmp/access.log --json --csv; then
+            echo "expected failure" >&2
+            exit 1
+          fi
+
       - name: Health check against a local server
         run: |
           python3 -m http.server 3000 --bind 127.0.0.1 >/dev/null 2>&1 &
