@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: bash -n report.sh
+
+      - name: Generate a sample log
+        run: ./sample/generate-log.sh 300 > /tmp/access.log
+
+      - name: Run the report
+        run: ./report.sh --log /tmp/access.log --out-dir /tmp/out
+
+      - name: Show the result
+        run: cat /tmp/out/report_*.md
+
+      - name: Missing log should fail
+        run: |
+          if ./report.sh --log /tmp/does-not-exist.log; then
+            echo "expected failure" >&2
+            exit 1
+          fi
