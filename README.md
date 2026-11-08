@@ -18,6 +18,8 @@ dependencies beyond the standard Unix tools.
 Plus top IPs causing server errors, the most requested paths, a status-code
 breakdown, and an optional uptime check.
 
+![server-log-report demo](docs/demo.gif)
+
 ## Why
 
 Every server writes a log. Almost nobody reads it. This script does the boring
