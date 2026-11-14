@@ -7,6 +7,11 @@
 #
 set -euo pipefail
 
+# Log fields are ASCII: case, numbers, IPs, URL paths. Byte-wise collation is
+# much faster than locale-aware collation and avoids surprises when parsing
+# numbers with a non-C locale.
+export LC_ALL=C
+
 VERSION="1.0.0"
 PROG="$(basename "$0")"
 
@@ -260,41 +265,61 @@ if [ -n "$SINCE" ] || [ -n "$UNTIL" ]; then
     mv "$WORKDIR/filtered" "$WORK"
 fi
 
-total=$(wc -l < "$WORK" | tr -d '[:space:]')
-errors4=$(awk -v f="$STATUS_FIELD" '$f ~ /^4/' "$WORK" | wc -l | tr -d '[:space:]')
-errors5=$(awk -v f="$STATUS_FIELD" '$f ~ /^5/' "$WORK" | wc -l | tr -d '[:space:]')
-malformed=$(awk -v m="$MIN_FIELDS" 'NF < m' "$WORK" | wc -l | tr -d '[:space:]')
+# One pass over the log. The previous version scanned the file six times and
+# sorted the full line set three times; this scans once and sorts only the
+# unique keys.
+: > "$WORKDIR/ips.raw"
+: > "$WORKDIR/paths.raw"
+: > "$WORKDIR/status.raw"
+
+awk -v ipf="$IP_FIELD" -v pathf="$PATH_FIELD" -v stf="$STATUS_FIELD" \
+    -v byf="$BYTES_FIELD" -v minf="$MIN_FIELDS" \
+    -v summary="$WORKDIR/summary.tsv" \
+    -v ips="$WORKDIR/ips.raw" \
+    -v paths="$WORKDIR/paths.raw" \
+    -v statuses="$WORKDIR/status.raw" '
+    {
+        total++
+        if (NF < minf) malformed++
+
+        status = (stf <= NF) ? $stf : ""
+        if (byf <= NF) bytes += $byf
+
+        if (status ~ /^4/) e4++
+        if (status ~ /^5/) {
+            e5++
+            ip_count[$ipf]++
+        }
+        if (pathf <= NF) path_count[$pathf]++
+        if (stf <= NF) status_count[status]++
+    }
+    END {
+        printf "%d\t%d\t%d\t%d\t%.0f\n", total, e4, e5, malformed, bytes > summary
+        for (k in ip_count)     printf "%d\t%s\n", ip_count[k], k > ips
+        for (k in path_count)   printf "%d\t%s\n", path_count[k], k > paths
+        for (k in status_count) printf "%d\t%s\n", status_count[k], k > statuses
+        close(summary); close(ips); close(paths); close(statuses)
+    }
+' "$WORK"
+
+IFS=$'\t' read -r total errors4 errors5 malformed bytes < "$WORKDIR/summary.tsv"
+
 rate=$(awk -v e="$errors5" -v t="$total" 'BEGIN { printf "%.2f", (t ? 100 * e / t : 0) }')
-bytes=$(awk -v f="$BYTES_FIELD" '{ s += $f } END { printf "%.0f", s }' "$WORK")
 served=$(awk -v b="$bytes" 'BEGIN { printf "%.1f", b / 1048576 }')
 
-# Turn "  12 value" lines (uniq -c) into "12<TAB>value", preserving the value.
-to_tsv() {
-    awk '{
-        line = $0
-        sub(/^[[:space:]]+/, "", line)
-        count = line
-        sub(/[[:space:]].*/, "", count)
-        value = line
-        sub(/^[^[:space:]]+[[:space:]]+/, "", value)
-        printf "%s\t%s\n", count, value
-    }'
+# Sort the aggregated counts. Ties fall back to the key, which matches the
+# previous "sort | uniq -c | sort -rn" ordering under LC_ALL=C.
+sort_top_tsv() {
+    sort -t $'\t' -k1,1nr -k2,2 | awk -v n="$TOP" 'NR <= n'
 }
 
-count_top_tsv() {
-    sort | uniq -c | sort -rn | awk -v n="$TOP" 'NR <= n' | to_tsv
+sort_all_tsv() {
+    sort -t $'\t' -k1,1nr -k2,2
 }
 
-count_all_tsv() {
-    sort | uniq -c | sort -rn | to_tsv
-}
-
-awk -v ip="$IP_FIELD" -v st="$STATUS_FIELD" '$st ~ /^5/ { print $ip }' "$WORK" \
-    | count_top_tsv > "$WORKDIR/ips.tsv"
-awk -v p="$PATH_FIELD" '{ print $p }' "$WORK" \
-    | count_top_tsv > "$WORKDIR/paths.tsv"
-awk -v st="$STATUS_FIELD" '{ print $st }' "$WORK" \
-    | count_all_tsv > "$WORKDIR/status.tsv"
+sort_top_tsv < "$WORKDIR/ips.raw"    > "$WORKDIR/ips.tsv"
+sort_top_tsv < "$WORKDIR/paths.raw"  > "$WORKDIR/paths.tsv"
+sort_all_tsv < "$WORKDIR/status.raw" > "$WORKDIR/status.tsv"
 
 csv_escape() {
     local s="$1"
