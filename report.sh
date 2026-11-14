@@ -7,7 +7,12 @@
 #
 set -euo pipefail
 
-VERSION="1.0.0"
+# Log fields are ASCII: case, numbers, IPs, URL paths. Byte-wise collation is
+# much faster than locale-aware collation and avoids surprises when parsing
+# numbers with a non-C locale.
+export LC_ALL=C
+
+VERSION="1.1.0"
 PROG="$(basename "$0")"
 
 LOG="/var/log/nginx/access.log"
@@ -18,6 +23,7 @@ INCLUDE_ROTATED=0
 HEALTH_ONLY=0
 JSON_OUT=0
 CSV_OUT=0
+LOW_MEMORY=0
 SINCE=""
 SINCE_NUM=""
 UNTIL=""
@@ -51,6 +57,7 @@ Options:
       --until DATE      only count entries on or before DATE (YYYY-MM-DD)
       --json            print a JSON report to stdout instead of Markdown
       --csv             print a CSV report to stdout instead of Markdown
+      --low-memory      bounded-memory mode: external sort instead of arrays
       --include-rotated read PATH.1 and PATH.*.gz as well
       --health-only     only run the health check, then exit
   -h, --help            show this help
@@ -123,6 +130,7 @@ while [ "$#" -gt 0 ]; do
         --until)           need_value "$@"; UNTIL="$2";        shift 2 ;;
         --json)            JSON_OUT=1;                         shift ;;
         --csv)             CSV_OUT=1;                          shift ;;
+        --low-memory)      LOW_MEMORY=1;                       shift ;;
         --include-rotated) INCLUDE_ROTATED=1;                  shift ;;
         --health-only)     HEALTH_ONLY=1;                      shift ;;
         -h|--help)         usage; exit 0 ;;
@@ -260,41 +268,95 @@ if [ -n "$SINCE" ] || [ -n "$UNTIL" ]; then
     mv "$WORKDIR/filtered" "$WORK"
 fi
 
-total=$(wc -l < "$WORK" | tr -d '[:space:]')
-errors4=$(awk -v f="$STATUS_FIELD" '$f ~ /^4/' "$WORK" | wc -l | tr -d '[:space:]')
-errors5=$(awk -v f="$STATUS_FIELD" '$f ~ /^5/' "$WORK" | wc -l | tr -d '[:space:]')
-malformed=$(awk -v m="$MIN_FIELDS" 'NF < m' "$WORK" | wc -l | tr -d '[:space:]')
+if [ "$LOW_MEMORY" -eq 1 ]; then
+    # Bounded-memory path: external sort. Slower, but memory stays flat even
+    # when the log has millions of unique paths.
+    total=$(wc -l < "$WORK" | tr -d '[:space:]')
+    errors4=$(awk -v f="$STATUS_FIELD" '$f ~ /^4/' "$WORK" | wc -l | tr -d '[:space:]')
+    errors5=$(awk -v f="$STATUS_FIELD" '$f ~ /^5/' "$WORK" | wc -l | tr -d '[:space:]')
+    malformed=$(awk -v m="$MIN_FIELDS" 'NF < m' "$WORK" | wc -l | tr -d '[:space:]')
+    bytes=$(awk -v f="$BYTES_FIELD" '{ s += $f } END { printf "%.0f", s }' "$WORK")
+
+    to_tsv() {
+        awk '{
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            count = line
+            sub(/[[:space:]].*/, "", count)
+            value = line
+            sub(/^[^[:space:]]+[[:space:]]+/, "", value)
+            printf "%s\t%s\n", count, value
+        }'
+    }
+
+    count_top_tsv() {
+        sort | uniq -c | sort -k1,1nr -k2 | awk -v n="$TOP" 'NR <= n' | to_tsv
+    }
+
+    count_all_tsv() {
+        sort | uniq -c | sort -k1,1nr -k2 | to_tsv
+    }
+
+    awk -v ip="$IP_FIELD" -v st="$STATUS_FIELD" '$st ~ /^5/ { print $ip }' "$WORK" \
+        | count_top_tsv > "$WORKDIR/ips.tsv"
+    awk -v p="$PATH_FIELD" '{ print $p }' "$WORK" \
+        | count_top_tsv > "$WORKDIR/paths.tsv"
+    awk -v st="$STATUS_FIELD" '{ print $st }' "$WORK" \
+        | count_all_tsv > "$WORKDIR/status.tsv"
+else
+    # Fast path: one scan, then sort only the unique keys. Memory scales with
+    # the number of unique keys; use --low-memory for pathological logs.
+    : > "$WORKDIR/ips.raw"
+    : > "$WORKDIR/paths.raw"
+    : > "$WORKDIR/status.raw"
+
+    awk -v ipf="$IP_FIELD" -v pathf="$PATH_FIELD" -v stf="$STATUS_FIELD" \
+        -v byf="$BYTES_FIELD" -v minf="$MIN_FIELDS" \
+        -v summary="$WORKDIR/summary.tsv" \
+        -v ips="$WORKDIR/ips.raw" \
+        -v paths="$WORKDIR/paths.raw" \
+        -v statuses="$WORKDIR/status.raw" '
+        {
+            total++
+            if (NF < minf) malformed++
+
+            status = (stf <= NF) ? $stf : ""
+            if (byf <= NF) bytes += $byf
+
+            if (status ~ /^4/) e4++
+            if (status ~ /^5/) {
+                e5++
+                ip_count[$ipf]++
+            }
+            if (pathf <= NF) path_count[$pathf]++
+            if (stf <= NF) status_count[status]++
+        }
+        END {
+            printf "%d\t%d\t%d\t%d\t%.0f\n", total, e4, e5, malformed, bytes > summary
+            for (k in ip_count)     printf "%d\t%s\n", ip_count[k], k > ips
+            for (k in path_count)   printf "%d\t%s\n", path_count[k], k > paths
+            for (k in status_count) printf "%d\t%s\n", status_count[k], k > statuses
+            close(summary); close(ips); close(paths); close(statuses)
+        }
+    ' "$WORK"
+
+    IFS=$'\t' read -r total errors4 errors5 malformed bytes < "$WORKDIR/summary.tsv"
+
+    sort_top_tsv() {
+        sort -t $'\t' -k1,1nr -k2,2 | awk -v n="$TOP" 'NR <= n'
+    }
+
+    sort_all_tsv() {
+        sort -t $'\t' -k1,1nr -k2,2
+    }
+
+    sort_top_tsv < "$WORKDIR/ips.raw"    > "$WORKDIR/ips.tsv"
+    sort_top_tsv < "$WORKDIR/paths.raw"  > "$WORKDIR/paths.tsv"
+    sort_all_tsv < "$WORKDIR/status.raw" > "$WORKDIR/status.tsv"
+fi
+
 rate=$(awk -v e="$errors5" -v t="$total" 'BEGIN { printf "%.2f", (t ? 100 * e / t : 0) }')
-bytes=$(awk -v f="$BYTES_FIELD" '{ s += $f } END { printf "%.0f", s }' "$WORK")
 served=$(awk -v b="$bytes" 'BEGIN { printf "%.1f", b / 1048576 }')
-
-# Turn "  12 value" lines (uniq -c) into "12<TAB>value", preserving the value.
-to_tsv() {
-    awk '{
-        line = $0
-        sub(/^[[:space:]]+/, "", line)
-        count = line
-        sub(/[[:space:]].*/, "", count)
-        value = line
-        sub(/^[^[:space:]]+[[:space:]]+/, "", value)
-        printf "%s\t%s\n", count, value
-    }'
-}
-
-count_top_tsv() {
-    sort | uniq -c | sort -rn | awk -v n="$TOP" 'NR <= n' | to_tsv
-}
-
-count_all_tsv() {
-    sort | uniq -c | sort -rn | to_tsv
-}
-
-awk -v ip="$IP_FIELD" -v st="$STATUS_FIELD" '$st ~ /^5/ { print $ip }' "$WORK" \
-    | count_top_tsv > "$WORKDIR/ips.tsv"
-awk -v p="$PATH_FIELD" '{ print $p }' "$WORK" \
-    | count_top_tsv > "$WORKDIR/paths.tsv"
-awk -v st="$STATUS_FIELD" '{ print $st }' "$WORK" \
-    | count_all_tsv > "$WORKDIR/status.tsv"
 
 csv_escape() {
     local s="$1"

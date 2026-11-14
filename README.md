@@ -72,6 +72,7 @@ report.sh [options]
       --until DATE      only count entries on or before DATE (YYYY-MM-DD)
       --json            print a JSON report to stdout instead of Markdown
       --csv             print a CSV report to stdout instead of Markdown
+      --low-memory      bounded-memory mode: external sort instead of arrays
       --include-rotated read PATH.1 and PATH.*.gz as well
       --health-only     only run the health check, then exit
   -h, --help            show the help
@@ -233,6 +234,34 @@ python3 -c "import pandas as pd; print(pd.read_csv('report.csv').head())"
 ```
 
 `--json` and `--csv` are mutually exclusive; pick one.
+
+## Performance and memory
+
+The default mode scans the log once, keeps per-key counts in memory, and sorts
+only the unique keys. That is roughly four to five times faster than sorting
+every line, but memory grows with the number of **unique** IPs and paths, not
+with the file size.
+
+On a 5M-line / 375 MB log with a handful of unique paths (development machine):
+
+| mode | time | peak memory |
+|---|---:|---:|
+| default | ~7 s | ~4 MB |
+| `--low-memory` | ~19 s | ~10 MB |
+
+On a pathological 2M-line log with 2M unique paths:
+
+| mode | time | peak memory |
+|---|---:|---:|
+| default | ~9 s | ~700 MB |
+| `--low-memory` | ~9 s | ~10 MB |
+
+So `--low-memory` is slower on normal logs but can be just as fast, and far
+lighter, when cardinality is extreme. Use it on small machines or when the log
+contains many unique URLs.
+
+All modes set `LC_ALL=C`. Log fields are ASCII, and byte-wise collation is
+significantly faster than locale-aware collation.
 
 ## Running it locally (e.g. `localhost:3000`)
 
